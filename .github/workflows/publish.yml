@@ -1,0 +1,105 @@
+# brew tap-new uses this file to generate a bottle publish workflow for the new tap
+name: brew pr-pull
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number
+        required: true
+      head_sha:
+        description: Expected pull request head commit SHA (optional)
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+env:
+  # bottles go to the r2 bucket behind this domain not github releases
+  R2_BUCKET: dayoff-releases
+  R2_PUBLIC_URL: https://dayoff-releases.peppr.dev
+
+jobs:
+  pr-pull:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      checks: read
+      contents: write
+      id-token: write
+      issues: read
+      pull-requests: write
+    steps:
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up git
+        id: git_setup
+        uses: Homebrew/actions/git-user-config@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+
+      - name: Pull bottles
+        id: pull_bottles
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_GIT_COMMITTER_NAME: ${{ steps.git_setup.outputs.name }}
+          HOMEBREW_GIT_COMMITTER_EMAIL: ${{ steps.git_setup.outputs.email }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+        run: |
+          # no-upload skips brew pr-upload which only knows github hosts so the next two steps do its job
+          if [[ -n "$HEAD_SHA" ]]
+          then
+            brew pr-pull --debug --retain-bottle-dir --no-upload --tap="$GITHUB_REPOSITORY" --head-sha="$HEAD_SHA" \
+              "$PULL_REQUEST"
+          else
+            brew pr-pull --debug --retain-bottle-dir --no-upload --tap="$GITHUB_REPOSITORY" "$PULL_REQUEST"
+          fi
+
+      - name: Write bottle block
+        env:
+          BOTTLE_DIR: ${{ steps.pull_bottles.outputs.bottle_path }}
+          HOMEBREW_GIT_COMMITTER_NAME: ${{ steps.git_setup.outputs.name }}
+          HOMEBREW_GIT_COMMITTER_EMAIL: ${{ steps.git_setup.outputs.email }}
+        run: |
+          cd "$BOTTLE_DIR"
+          # brew bottle --merge takes root_url from the json not --root-url so set it there like brew pr-upload does
+          for json in ./*.bottle.json
+          do
+            jq --arg url "$R2_PUBLIC_URL/bottles" 'map_values(.bottle.root_url = $url)' "$json" > "$json.tmp"
+            mv "$json.tmp" "$json"
+          done
+          brew bottle --merge --write ./*.bottle.json
+
+      - name: Upload bottles to R2
+        env:
+          BOTTLE_DIR: ${{ steps.pull_bottles.outputs.bottle_path }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          cd "$BOTTLE_DIR"
+          # upload each bottle under the name brew downloads it by
+          jq -r '.[].bottle.tags[] | [.local_filename, .filename] | @tsv' ./*.bottle.json |
+            while IFS=$'\t' read -r local_file remote_file
+            do
+              aws s3 cp "$local_file" "s3://$R2_BUCKET/bottles/$remote_file" --no-progress \
+                --content-type application/gzip --cache-control "public, max-age=31536000, immutable"
+            done
+
+      - name: Generate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: "${{ steps.pull_bottles.outputs.bottle_path }}/*.tar.gz"
+
+      - name: Push commits
+        uses: Homebrew/actions/git-try-push@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        with:
+          branch: main
